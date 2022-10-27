@@ -39,6 +39,7 @@ type rabbitMq struct {
 	brokerQueue                amqp.Queue
 	brokerInputMessagesChannel <-chan amqp.Delivery
 	worker                     *worker.Worker
+	done                       chan error
 }
 
 func newTrigger(parentLogger logger.Logger,
@@ -60,6 +61,7 @@ func newTrigger(parentLogger logger.Logger,
 	newTrigger := rabbitMq{
 		AbstractTrigger: abstractTrigger,
 		configuration:   configuration,
+		done:            make(chan error),
 	}
 	newTrigger.AbstractTrigger.Trigger = &newTrigger
 
@@ -84,9 +86,27 @@ func (rmq *rabbitMq) Start(checkpoint functionconfig.Checkpoint) error {
 	}
 
 	// start listening for published messages
-	go rmq.handleBrokerMessages()
+	go rmq.handle()
 
 	return nil
+}
+
+func (rmq *rabbitMq) reconnect() error {
+	//sleep 10 seconds to reconnect
+	time.Sleep(10 * time.Second)
+
+	//connect to rabbitmq
+	err := rmq.createBrokerResources()
+	if err != nil {
+		rmq.Logger.InfoWith("Creating broker resources",
+			"brokerUrl", rmq.configuration.URL,
+			"exchangeName", rmq.configuration.ExchangeName,
+			"queueName", rmq.configuration.QueueName,
+			"topics", rmq.configuration.Topics,
+			"error", err.Error(),
+		)
+	}
+	return err
 }
 
 func (rmq *rabbitMq) Stop(force bool) (functionconfig.Checkpoint, error) {
@@ -121,6 +141,14 @@ func (rmq *rabbitMq) createBrokerResources() error {
 	if err != nil {
 		return errors.Wrap(err, "Failed to create connection to broker")
 	}
+
+	go func() {
+		// Waits here for the channel to be closed
+		rmq.Logger.InfoWith("Rabbitmq connection closed",
+			"errorMsg", <-rmq.brokerConn.NotifyClose(make(chan *amqp.Error)))
+		// Let Handle know it's not time to reconnect
+		rmq.done <- errors.New("Channel Closed")
+	}()
 
 	rmq.Logger.DebugWith("Connected to broker", "brokerUrl", rmq.configuration.URL)
 
@@ -199,6 +227,18 @@ func (rmq *rabbitMq) createBrokerResources() error {
 	return nil
 }
 
+func (rmq *rabbitMq) handle() {
+	for {
+		go rmq.handleBrokerMessages()
+		if <-rmq.done != nil {
+			err := rmq.reconnect()
+			if err != nil {
+				rmq.Logger.ErrorWith("Connect rabbitmq error")
+			}
+		}
+	}
+}
+
 func (rmq *rabbitMq) handleBrokerMessages() {
 	for message := range rmq.brokerInputMessagesChannel {
 
@@ -206,7 +246,7 @@ func (rmq *rabbitMq) handleBrokerMessages() {
 		rmq.event.message = &message
 
 		// submit to worker
-		_, submitError, _ := rmq.AllocateWorkerAndSubmitEvent(&rmq.event, nil, 10*time.Second)
+		_, submitError, _ := rmq.AllocateWorkerAndSubmitEvent(&rmq.event, nil, time.Duration(*rmq.configuration.WorkerAvailabilityTimeoutMilliseconds)*time.Millisecond)
 
 		// ack the message if we didn't fail to submit
 		if submitError == nil {

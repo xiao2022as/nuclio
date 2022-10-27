@@ -246,6 +246,7 @@ processor: ensure-gopath build-base
 		--build-arg NUCLIO_GO_LINK_FLAGS_INJECT_VERSION="$(GO_LINK_FLAGS_INJECT_VERSION)" \
 		--build-arg NUCLIO_LABEL=$(NUCLIO_LABEL) \
 		--build-arg NUCLIO_DOCKER_REPO=$(NUCLIO_DOCKER_REPO) \
+		--build-arg NUCLIO_GO_PROXY=$(NUCLIO_GO_PROXY) \
 		--file cmd/processor/Dockerfile \
 		--tag $(NUCLIO_DOCKER_REPO)/processor:$(NUCLIO_DOCKER_IMAGE_TAG) .
 
