@@ -40,6 +40,8 @@ type rabbitMq struct {
 	brokerInputMessagesChannel <-chan amqp.Delivery
 	worker                     *worker.Worker
 	done                       chan error
+	channelNotify              chan *amqp.Error
+	connNotify                 chan *amqp.Error
 }
 
 func newTrigger(parentLogger logger.Logger,
@@ -92,13 +94,15 @@ func (rmq *rabbitMq) Start(checkpoint functionconfig.Checkpoint) error {
 }
 
 func (rmq *rabbitMq) reconnect() error {
-	//sleep 10 seconds to reconnect
-	time.Sleep(10 * time.Second)
-
+	//sleep 30 seconds to reconnect
+	time.Sleep(30 * time.Second)
+	rmq.Logger.InfoWith("Try to Reconnect to broker",
+		"brokerUrl", rmq.configuration.URL,
+	)
 	//connect to rabbitmq
 	err := rmq.createBrokerResources()
 	if err != nil {
-		rmq.Logger.InfoWith("Creating broker resources",
+		rmq.Logger.InfoWith("Reconnect to broker error",
 			"brokerUrl", rmq.configuration.URL,
 			"exchangeName", rmq.configuration.ExchangeName,
 			"queueName", rmq.configuration.QueueName,
@@ -111,8 +115,22 @@ func (rmq *rabbitMq) reconnect() error {
 
 func (rmq *rabbitMq) Stop(force bool) (functionconfig.Checkpoint, error) {
 
-	// TODO
+	close(rmq.done)
+	rmq.closeConn()
+
 	return nil, nil
+}
+
+func (rmq *rabbitMq) closeConn() {
+	if !rmq.brokerConn.IsClosed() {
+		// close message delivery
+		if err := rmq.brokerChannel.Cancel(rmq.ID, true); err != nil {
+			rmq.Logger.ErrorWith("rabbitmq consumer - channel cancel failed: ", "msg", err)
+		}
+		if err := rmq.brokerConn.Close(); err != nil {
+			rmq.Logger.ErrorWith("rabbitmq consumer - connection close failed: ", "msg", err)
+		}
+	}
 }
 
 func (rmq *rabbitMq) GetConfig() map[string]interface{} {
@@ -141,28 +159,17 @@ func (rmq *rabbitMq) createBrokerResources() error {
 	if err != nil {
 		return errors.Wrap(err, "Failed to create connection to broker")
 	}
-
-	go func() {
-		// Waits here for the channel to be closed
-		rmq.Logger.InfoWith("Rabbitmq connection closed",
-			"errorMsg", <-rmq.brokerConn.NotifyClose(make(chan *amqp.Error)))
-		// Let Handle know it's not time to reconnect
-		rmq.done <- errors.New("Channel Closed")
-	}()
-
 	rmq.Logger.DebugWith("Connected to broker", "brokerUrl", rmq.configuration.URL)
 
 	rmq.brokerChannel, err = rmq.brokerConn.Channel()
 	if err != nil {
 		return errors.Wrap(err, "Failed to create channel")
 	}
-
 	rmq.Logger.DebugWith("Created broker channel")
 
 	// create exchange and queue only if user provided topics, else assuming the user did all the necessary configuration
 	// to support listening on the provided exchange and queue
 	if len(rmq.configuration.Topics) > 0 {
-
 		// create the exchange
 		err = rmq.brokerChannel.ExchangeDeclare(rmq.configuration.ExchangeName,
 			"topic",
@@ -211,7 +218,7 @@ func (rmq *rabbitMq) createBrokerResources() error {
 
 	rmq.brokerInputMessagesChannel, err = rmq.brokerChannel.Consume(
 		rmq.configuration.QueueName, // queue
-		"",                          // consumer
+		rmq.ID,                      // consumer
 		false,                       // auto-ack
 		false,                       // exclusive
 		false,                       // no-local
@@ -224,17 +231,48 @@ func (rmq *rabbitMq) createBrokerResources() error {
 
 	rmq.Logger.DebugWith("Starting consumption from queue", "queueName", rmq.configuration.QueueName)
 
+	//add connection and channel close listener
+	rmq.connNotify = rmq.brokerConn.NotifyClose(make(chan *amqp.Error))
+	rmq.channelNotify = rmq.brokerChannel.NotifyClose(make(chan *amqp.Error))
+
 	return nil
 }
 
 func (rmq *rabbitMq) handle() {
 	for {
+		//no exception, start handle message
 		go rmq.handleBrokerMessages()
-		if <-rmq.done != nil {
-			err := rmq.reconnect()
+		rmq.Logger.Info("Connect to MQ success, start consume messages")
+
+		select {
+		case err := <-rmq.connNotify:
 			if err != nil {
-				rmq.Logger.ErrorWith("Connect rabbitmq error")
+				rmq.Logger.ErrorWith("rabbitmq consumer - connection NotifyClose: ", "msg", err)
 			}
+		case err := <-rmq.channelNotify:
+			if err != nil {
+				rmq.Logger.ErrorWith("rabbitmq consumer - channel NotifyClose: ", "msg", err)
+			}
+		case <-rmq.done:
+			rmq.Logger.InfoWith("Rabbitmq trigger exit")
+			return
+		}
+		// backstop
+		rmq.closeConn()
+
+		// clear channel notify
+		for err := range rmq.channelNotify {
+			rmq.Logger.ErrorWith("rabbitmq consumer - channel notify read failed: ", "msg", err)
+		}
+		// clear connection notify
+		for err := range rmq.connNotify {
+			rmq.Logger.ErrorWith("rabbitmq consumer - connection notify read failed: ", "msg", err)
+		}
+		//wait rmq connect
+		for err := rmq.reconnect(); err != nil; {
+			rmq.Logger.ErrorWith("Connect rabbitmq error, will reconnect after 30 seconds",
+				"errorMsg",
+				err.Error())
 		}
 	}
 }

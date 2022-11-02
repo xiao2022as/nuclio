@@ -41,6 +41,10 @@ func (f *factory) Create(parentLogger logger.Logger,
 	// create logger parent
 	triggerLogger := parentLogger.GetChild(triggerConfiguration.Kind)
 
+	triggerLogger.InfoWith("Try to create kafka trigger ",
+		"id", id,
+		"triggerConfiguration", triggerConfiguration,
+		"runtimeConfiguration", runtimeConfiguration)
 	configuration, err := NewConfiguration(id, triggerConfiguration, runtimeConfiguration, triggerLogger)
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed to create configuration")
